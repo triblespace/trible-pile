@@ -44,6 +44,7 @@ pub struct Pile<const MAX_PILE_SIZE: usize> {
     index: RwLock<HashMap<[u8; 32], Mutex<IndexEntry>>>,
 }
 
+#[derive(Debug)]
 pub enum LoadError {
     IoError(std::io::Error),
     MagicMarkerError,
@@ -55,6 +56,54 @@ pub enum LoadError {
 impl From<std::io::Error> for LoadError {
     fn from(err: std::io::Error) -> Self {
         Self::IoError(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum InsertError {
+    IoError(std::io::Error),
+    PoisonError,
+}
+
+impl From<std::io::Error> for InsertError {
+    fn from(err: std::io::Error) -> Self {
+        Self::IoError(err)
+    }
+}
+
+impl<T> From<PoisonError<T>> for InsertError {
+    fn from(_err: PoisonError<T>) -> Self {
+        Self::PoisonError
+    }
+}
+
+#[derive(Debug)]
+pub enum GetError {
+    PoisonError,
+    ValidationError(Bytes),
+}
+
+impl<T> From<PoisonError<T>> for GetError {
+    fn from(_err: PoisonError<T>) -> Self {
+        Self::PoisonError
+    }
+}
+
+#[derive(Debug)]
+pub enum FlushError {
+    IoError(std::io::Error),
+    PoisonError,
+}
+
+impl From<std::io::Error> for FlushError {
+    fn from(err: std::io::Error) -> Self {
+        Self::IoError(err)
+    }
+}
+
+impl<T> From<PoisonError<T>> for FlushError {
+    fn from(_err: PoisonError<T>) -> Self {
+        Self::PoisonError
     }
 }
 
@@ -93,54 +142,9 @@ fn load_index(bytes: Bytes) -> Result<HashMap<[u8; 32], Mutex<IndexEntry>>, Load
     Ok(index)
 }
 
-pub enum InsertError {
-    IoError(std::io::Error),
-    PoisonError,
-}
-
-impl From<std::io::Error> for InsertError {
-    fn from(err: std::io::Error) -> Self {
-        Self::IoError(err)
-    }
-}
-
-impl<T> From<PoisonError<T>> for InsertError {
-    fn from(_err: PoisonError<T>) -> Self {
-        Self::PoisonError
-    }
-}
-
-pub enum GetError {
-    PoisonError,
-    ValidationError(Bytes),
-}
-
-impl<T> From<PoisonError<T>> for GetError {
-    fn from(_err: PoisonError<T>) -> Self {
-        Self::PoisonError
-    }
-}
-
-pub enum FlushError {
-    IoError(std::io::Error),
-    PoisonError,
-}
-
-impl From<std::io::Error> for FlushError {
-    fn from(err: std::io::Error) -> Self {
-        Self::IoError(err)
-    }
-}
-
-impl<T> From<PoisonError<T>> for FlushError {
-    fn from(_err: PoisonError<T>) -> Self {
-        Self::PoisonError
-    }
-}
-
 impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
-    pub fn new(path: &Path) -> Result<Self, LoadError> {
-        let file = OpenOptions::new().append(true).create(true).open(&path)?;
+    pub fn load(path: &Path) -> Result<Self, LoadError> {
+        let file = OpenOptions::new().read(true).append(true).create(true).open(&path)?;
         let file_len = file.metadata()?.len() as usize;
         let mmap = MmapOptions::new()
             .len(MAX_PILE_SIZE)
@@ -161,12 +165,15 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
         Ok(Self { file, mmap, index })
     }
 
+    //TODO: make sure that the pile size does not exceed MAX_PILE_SIZE
     pub fn insert(&mut self, value: &Bytes) -> Result<([u8; 32], Bytes), InsertError> {
         let mut append = self.file.lock().unwrap();
 
         let hash: [u8; 32] = Blake3::digest(&value).into();
 
         let mut header: [u8; 64] = [0; 64];
+        header[0..16].copy_from_slice(&MAGIC_MARKER);
+        header[24..32].copy_from_slice(&(value.len() as u64).to_le_bytes());
         header[32..64].copy_from_slice(&hash);
 
         let padding = 64 - (value.len() % 64);
@@ -229,7 +236,7 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
 
     pub fn flush(&self) -> Result<(), FlushError> {
         let append = self.file.lock()?;
-        append.file.sync_data()?;
+        append.file.sync_all()?;
         Ok(())
     }
 }
