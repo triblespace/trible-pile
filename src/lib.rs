@@ -7,10 +7,17 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::ptr::slice_from_raw_parts;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, io::Write};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 const MAGIC_MARKER: [u8; 16] = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
+//TODO: Do we want to use different magic markers for different versions of the format?
+// Or to distinguish between little and big endian header fields?
+// Or do we want to have a "Head" type that encodes a `tribles::Head` and a
+// short human readable name.
+
+pub type Hash = [u8; 32];
 
 struct AppendFile {
     file: File,
@@ -31,17 +38,28 @@ struct IndexEntry {
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
-struct BlobHeader {
+struct Header {
     magic_marker: [u8; 16],
-    padding: [u8; 8],
+    timestamp: u64,
     length: u64,
-    hash: [u8; 32],
+    hash: Hash,
+}
+
+impl Header {
+    fn new(timestamp: u64, length: u64, hash: Hash) -> Self {
+        Self {
+            magic_marker: MAGIC_MARKER,
+            timestamp,
+            length,
+            hash,
+        }
+    }
 }
 
 pub struct Pile<const MAX_PILE_SIZE: usize> {
     file: Mutex<AppendFile>,
     mmap: Arc<memmap2::MmapRaw>,
-    index: RwLock<HashMap<[u8; 32], Mutex<IndexEntry>>>,
+    index: RwLock<HashMap<Hash, Mutex<IndexEntry>>>,
 }
 
 #[derive(Debug)]
@@ -51,6 +69,7 @@ pub enum LoadError {
     HeaderError,
     UnexpectedEndOfFile,
     FileLengthError,
+    PileTooLarge,
 }
 
 impl From<std::io::Error> for LoadError {
@@ -63,6 +82,7 @@ impl From<std::io::Error> for LoadError {
 pub enum InsertError {
     IoError(std::io::Error),
     PoisonError,
+    PileTooLarge,
 }
 
 impl From<std::io::Error> for InsertError {
@@ -107,87 +127,98 @@ impl<T> From<PoisonError<T>> for FlushError {
     }
 }
 
-//TODO: Add db recovery if the last blob is not complete
-fn load_index(bytes: Bytes) -> Result<HashMap<[u8; 32], Mutex<IndexEntry>>, LoadError> {
-    if bytes.len() % 64 != 0 {
-        return Err(LoadError::FileLengthError);
-    }
-
-    let mut bytes = bytes;
-    let mut index = HashMap::new();
-
-    while let Ok(header) = bytes.view_prefix::<BlobHeader>() {
-        if header.magic_marker != MAGIC_MARKER {
-            return Err(LoadError::MagicMarkerError);
-        }
-        if header.padding != [0; 8] {
-            return Err(LoadError::HeaderError);
-        }
-        let hash = header.hash;
-        let length = header.length as usize;
-        let Some(blob_bytes) = bytes.take_prefix(length) else {
-            return Err(LoadError::UnexpectedEndOfFile);
-        };
-
-        let Some(_) = bytes.take_prefix(64 - (length % 64)) else {
-            return Err(LoadError::UnexpectedEndOfFile);
-        };
-
-        let blob = IndexEntry {
-            state: ValidationState::Unvalidated,
-            bytes: blob_bytes,
-        };
-        index.insert(hash, Mutex::new(blob));
-    }
-    Ok(index)
-}
-
 impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
     pub fn load(path: &Path) -> Result<Self, LoadError> {
-        let file = OpenOptions::new().read(true).append(true).create(true).open(&path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)?;
         let file_len = file.metadata()?.len() as usize;
+        if file_len > MAX_PILE_SIZE {
+            return Err(LoadError::PileTooLarge);
+        }
         let mmap = MmapOptions::new()
             .len(MAX_PILE_SIZE)
             .map_raw_read_only(&file)?;
         let mmap = Arc::new(mmap);
-        let all_bytes = unsafe {
+        let mut bytes = unsafe {
             let written_slice = slice_from_raw_parts(mmap.as_ptr(), file_len)
                 .as_ref()
                 .unwrap();
             Bytes::from_raw_parts(written_slice, mmap.clone())
         };
-        let index = load_index(all_bytes)?;
+        if bytes.len() % 64 != 0 {
+            return Err(LoadError::FileLengthError);
+        }
+
+        let mut index = HashMap::new();
+
+        while let Ok(header) = bytes.view_prefix::<Header>() {
+            if header.magic_marker != MAGIC_MARKER {
+                return Err(LoadError::MagicMarkerError);
+            }
+            let hash = header.hash;
+            let length = header.length as usize;
+            let Some(blob_bytes) = bytes.take_prefix(length) else {
+                return Err(LoadError::UnexpectedEndOfFile);
+            };
+
+            let Some(_) = bytes.take_prefix(64 - (length % 64)) else {
+                return Err(LoadError::UnexpectedEndOfFile);
+            };
+
+            let blob = IndexEntry {
+                state: ValidationState::Unvalidated,
+                bytes: blob_bytes,
+            };
+            index.insert(hash, Mutex::new(blob));
+        }
+
         let index = RwLock::new(index);
+
         let file = Mutex::new(AppendFile {
             file,
             length: file_len,
         });
+
         Ok(Self { file, mmap, index })
     }
 
-    //TODO: make sure that the pile size does not exceed MAX_PILE_SIZE
-    pub fn insert(&mut self, value: &Bytes) -> Result<([u8; 32], Bytes), InsertError> {
+    #[must_use]
+    fn insert_raw(
+        &mut self,
+        hash: Hash,
+        validation: ValidationState,
+        value: &Bytes,
+    ) -> Result<Bytes, InsertError> {
         let mut append = self.file.lock().unwrap();
 
-        let hash: [u8; 32] = Blake3::digest(&value).into();
-
-        let mut header: [u8; 64] = [0; 64];
-        header[0..16].copy_from_slice(&MAGIC_MARKER);
-        header[24..32].copy_from_slice(&(value.len() as u64).to_le_bytes());
-        header[32..64].copy_from_slice(&hash);
-
+        let old_length = append.length;
         let padding = 64 - (value.len() % 64);
 
-        append.file.write_all(&header)?;
+        let new_length = old_length + 64 + value.len() + padding;
+        if new_length > MAX_PILE_SIZE {
+            return Err(InsertError::PileTooLarge);
+        }
+
+        append.length = new_length;
+
+        let now_in_sys = SystemTime::now();
+        let now_since_epoch = now_in_sys
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards");
+        let now_in_ms = now_since_epoch.as_millis();
+
+        let header = Header::new(now_in_ms as u64, value.len() as u64, hash);
+
+        append.file.write_all(header.as_bytes())?;
         append.file.write_all(&value)?;
         append.file.write_all(&[0; 64][0..padding])?;
 
-        let old_offset = append.length;
-        append.length = old_offset + 64 + value.len() + padding;
-
         let written_bytes = unsafe {
             let written_slice =
-                slice_from_raw_parts(self.mmap.as_ptr().offset(old_offset as _), value.len())
+                slice_from_raw_parts(self.mmap.as_ptr().offset(old_length as _), value.len())
                     .as_ref()
                     .unwrap();
             Bytes::from_raw_parts(written_slice, self.mmap.clone())
@@ -197,18 +228,31 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
         index.insert(
             hash,
             Mutex::new(IndexEntry {
-                state: ValidationState::Validated,
+                state: validation,
                 bytes: written_bytes.clone(),
             }),
         );
 
-        // TODO: do we want to introduce a paranoid mode here ^,
-        // this would be Unvalidated, and we would validate on first access
-
-        Ok((hash, written_bytes))
+        Ok(written_bytes)
     }
 
-    pub fn get(&self, hash: &[u8; 32]) -> Result<Option<Bytes>, GetError> {
+    pub fn insert(&mut self, value: &Bytes) -> Result<Hash, InsertError> {
+        let hash: Hash = Blake3::digest(&value).into();
+
+        let _bytes = self.insert_raw(hash, ValidationState::Validated, value)?;
+
+        Ok(hash)
+    }
+
+    pub fn insert_validated(&mut self, hash: Hash, value: &Bytes) -> Result<Bytes, InsertError> {
+        self.insert_raw(hash, ValidationState::Validated, value)
+    }
+
+    pub fn insert_unvalidated(&mut self, hash: Hash, value: &Bytes) -> Result<Bytes, InsertError> {
+        self.insert_raw(hash, ValidationState::Unvalidated, value)
+    }
+
+    pub fn get(&self, hash: &Hash) -> Result<Option<Bytes>, GetError> {
         let index = self.index.read().unwrap();
         let Some(blob) = index.get(hash) else {
             return Ok(None);
@@ -222,7 +266,7 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
                 return Err(GetError::ValidationError(entry.bytes.clone()));
             }
             ValidationState::Unvalidated => {
-                let computed_hash: [u8; 32] = Blake3::digest(&entry.bytes).into();
+                let computed_hash: Hash = Blake3::digest(&entry.bytes).into();
                 if computed_hash != *hash {
                     entry.state = ValidationState::Invalid;
                     return Err(GetError::ValidationError(entry.bytes.clone()));
@@ -236,32 +280,57 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
 
     pub fn flush(&self) -> Result<(), FlushError> {
         let append = self.file.lock()?;
-        append.file.sync_all()?;
+        append.file.sync_data()?;
         Ok(())
+    }
+}
+
+impl<const MAX_PILE_SIZE: usize> Extend<Bytes> for Pile<MAX_PILE_SIZE> {
+    fn extend<T: IntoIterator<Item = Bytes>>(&mut self, iter: T) {
+        for bytes in iter {
+            let _ = self.insert(&bytes);
+        }
+    }
+}
+
+impl<const MAX_PILE_SIZE: usize> Extend<(Hash, Bytes)> for Pile<MAX_PILE_SIZE> {
+    fn extend<T: IntoIterator<Item = (Hash, Bytes)>>(&mut self, iter: T) {
+        for (hash, bytes) in iter {
+            let _ = self.insert_unvalidated(hash, &bytes);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ptr::slice_from_raw_parts;
-
     use super::*;
 
-    use tempfile::tempfile;
+    use rand::RngCore;
+    use tempfile;
 
     #[test]
-    fn it_works() {
-        const MAX_PILE_SIZE: usize = 1 << 40;
+    fn load() {
+        const RECORD_LEN: usize = 1 << 10; // 1k
+        const RECORD_COUNT: usize = 1 << 20; // 1M
+        const MAX_PILE_SIZE: usize = 1 << 30; // 100GB
 
-        let tmp = tempfile().unwrap();
-        let mmap = MmapOptions::new()
-            .len(MAX_PILE_SIZE)
-            .map_raw_read_only(&tmp)
-            .unwrap();
+        let mut rng = rand::thread_rng();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp_pile = tmp_dir.path().join("test.pile");
+        let mut pile: Pile<MAX_PILE_SIZE> = Pile::load(&tmp_pile).unwrap();
 
-        let slice = unsafe { slice_from_raw_parts(mmap.as_ptr(), 9).as_ref().unwrap() };
-        let bytes = Bytes::from(&slice[..]);
+        (0..RECORD_COUNT).for_each(|_| {
+            let mut record = Vec::with_capacity(RECORD_LEN);
+            rng.fill_bytes(&mut record);
 
-        assert_eq!(b"# memmap2", &bytes[..]);
+            let data = Bytes::from_source(record);
+            pile.insert(&data).unwrap();
+        });
+
+        pile.flush().unwrap();
+
+        drop(pile);
+
+        let _pile: Pile<MAX_PILE_SIZE> = Pile::load(&tmp_pile).unwrap();
     }
 }
