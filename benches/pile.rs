@@ -7,8 +7,8 @@ use tempfile::TempDir;
 use trible_pile::{Hash, Pile};
 
 fn pile(c: &mut Criterion) {
-    const RECORD_LEN: usize = 1 << 10; // 1k
-    const RECORD_COUNT: usize = 1 << 20; // 1M
+    const RECORD_LEN: usize = 1 << 20; // 1k
+    const RECORD_COUNT: usize = 1 << 10; // 1M
     const MAX_PILE_SIZE: usize = 1 << 35; // 100GB
 
     let mut group = c.benchmark_group("pile");
@@ -33,7 +33,7 @@ fn pile(c: &mut Criterion) {
                 let tmp_pile = tmp_dir.path().join("test.pile");
                 let mut pile: Pile<MAX_PILE_SIZE> = Pile::load(&tmp_pile).unwrap();
                 data.iter().for_each(|data| {
-                    pile.insert(data).unwrap();
+                    pile.insert_blob(data).unwrap();
                 });
             },
             BatchSize::PerIteration,
@@ -63,7 +63,7 @@ fn pile(c: &mut Criterion) {
                 let tmp_pile = tmp_dir.path().join("test.pile");
                 let mut pile: Pile<MAX_PILE_SIZE> = Pile::load(&tmp_pile).unwrap();
                 data.iter().for_each(|(hash, data)| {
-                    pile.insert_unvalidated(*hash, data).unwrap();
+                    pile.insert_blob_unvalidated(*hash, data).unwrap();
                 });
             },
             BatchSize::PerIteration,
@@ -90,7 +90,7 @@ fn pile(c: &mut Criterion) {
                 let tmp_pile = tmp_dir.path().join("test.pile");
                 let mut pile: Pile<MAX_PILE_SIZE> = Pile::load(&tmp_pile).unwrap();
                 data.iter().for_each(|data| {
-                    pile.insert(data).unwrap();
+                    pile.insert_blob(data).unwrap();
                     pile.flush().unwrap();
                 });
             },
@@ -112,7 +112,7 @@ fn pile(c: &mut Criterion) {
                     rng.fill_bytes(&mut record);
 
                     let data = Bytes::from_source(record);
-                    pile.insert(&data).unwrap();
+                    pile.insert_blob(&data).unwrap();
                 });
 
                 pile.flush().unwrap();

@@ -11,12 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, io::Write};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-const MAGIC_MARKER: [u8; 16] = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
-//TODO: Do we want to use different magic markers for different versions of the format?
-// Or to distinguish between little and big endian header fields?
-// Or do we want to have a "Head" type that encodes a `tribles::Head` and a
-// short human readable name.
+const MAGIC_MARKER_BLOB: [u8; 16] = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
+const MAGIC_MARKER_BRANCH: [u8; 16] = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
 
+
+
+pub type Id = [u8; 16];
 pub type Hash = [u8; 32];
 
 struct AppendFile {
@@ -36,19 +36,37 @@ struct IndexEntry {
     state: ValidationState,
 }
 
-#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
-struct Header {
-    magic_marker: [u8; 16],
+struct BranchHeader {
+    magic_marker: Id,
+    branch_id: Id,
+    hash: Hash,
+}
+
+impl BranchHeader {
+    fn new(branch_id: Id, hash: Hash) -> Self {
+        Self {
+            magic_marker: MAGIC_MARKER_BRANCH,
+            branch_id,
+            hash,
+        }
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct BlobHeader {
+    magic_marker: Id,
     timestamp: u64,
     length: u64,
     hash: Hash,
 }
 
-impl Header {
+impl BlobHeader {
     fn new(timestamp: u64, length: u64, hash: Hash) -> Self {
         Self {
-            magic_marker: MAGIC_MARKER,
+            magic_marker: MAGIC_MARKER_BLOB,
             timestamp,
             length,
             hash,
@@ -60,6 +78,7 @@ pub struct Pile<const MAX_PILE_SIZE: usize> {
     file: Mutex<AppendFile>,
     mmap: Arc<memmap2::MmapRaw>,
     index: RwLock<HashMap<Hash, Mutex<IndexEntry>>>,
+    branches: RwLock<HashMap<Id, Hash>>,
 }
 
 #[derive(Debug)]
@@ -153,40 +172,59 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
         }
 
         let mut index = HashMap::new();
+        let mut branches = HashMap::new();
 
-        while let Ok(header) = bytes.view_prefix::<Header>() {
-            if header.magic_marker != MAGIC_MARKER {
-                return Err(LoadError::MagicMarkerError);
+        while bytes.len() > 0 {
+            if bytes.len() < 16 {
+                return Err(LoadError::UnexpectedEndOfFile);
             }
-            let hash = header.hash;
-            let length = header.length as usize;
-            let Some(blob_bytes) = bytes.take_prefix(length) else {
-                return Err(LoadError::UnexpectedEndOfFile);
+            let magic = bytes[0..16].try_into().unwrap();
+            match magic {
+                MAGIC_MARKER_BLOB => {
+                    let Ok(header) = bytes.view_prefix::<BlobHeader>() else {
+                        return Err(LoadError::HeaderError);
+                    };
+                    let hash = header.hash;
+                    let length = header.length as usize;
+                    let Some(blob_bytes) = bytes.take_prefix(length) else {
+                        return Err(LoadError::UnexpectedEndOfFile);
+                    };
+        
+                    let Some(_) = bytes.take_prefix(64 - (length % 64)) else {
+                        return Err(LoadError::UnexpectedEndOfFile);
+                    };
+        
+                    let blob = IndexEntry {
+                        state: ValidationState::Unvalidated,
+                        bytes: blob_bytes,
+                    };
+                    index.insert(hash, Mutex::new(blob));
+                }
+                MAGIC_MARKER_BRANCH => {
+                    let Ok(header) = bytes.view_prefix::<BranchHeader>() else {
+                        return Err(LoadError::HeaderError);
+                    };
+                    let branch_id = header.branch_id;
+                    let hash = header.hash;
+                    branches.insert(branch_id, hash);
+                }
+                _ => return Err(LoadError::MagicMarkerError)
             };
-
-            let Some(_) = bytes.take_prefix(64 - (length % 64)) else {
-                return Err(LoadError::UnexpectedEndOfFile);
-            };
-
-            let blob = IndexEntry {
-                state: ValidationState::Unvalidated,
-                bytes: blob_bytes,
-            };
-            index.insert(hash, Mutex::new(blob));
         }
 
         let index = RwLock::new(index);
+        let branches = RwLock::new(branches);
 
         let file = Mutex::new(AppendFile {
             file,
             length: file_len,
         });
 
-        Ok(Self { file, mmap, index })
+        Ok(Self { file, mmap, index, branches })
     }
 
     #[must_use]
-    fn insert_raw(
+    fn insert_blob_raw(
         &mut self,
         hash: Hash,
         validation: ValidationState,
@@ -210,7 +248,7 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
             .expect("time went backwards");
         let now_in_ms = now_since_epoch.as_millis();
 
-        let header = Header::new(now_in_ms as u64, value.len() as u64, hash);
+        let header = BlobHeader::new(now_in_ms as u64, value.len() as u64, hash);
 
         append.file.write_all(header.as_bytes())?;
         append.file.write_all(&value)?;
@@ -236,23 +274,23 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
         Ok(written_bytes)
     }
 
-    pub fn insert(&mut self, value: &Bytes) -> Result<Hash, InsertError> {
+    pub fn insert_blob(&mut self, value: &Bytes) -> Result<Hash, InsertError> {
         let hash: Hash = Blake3::digest(&value).into();
 
-        let _bytes = self.insert_raw(hash, ValidationState::Validated, value)?;
+        let _bytes = self.insert_blob_raw(hash, ValidationState::Validated, value)?;
 
         Ok(hash)
     }
 
-    pub fn insert_validated(&mut self, hash: Hash, value: &Bytes) -> Result<Bytes, InsertError> {
-        self.insert_raw(hash, ValidationState::Validated, value)
+    pub fn insert_blob_validated(&mut self, hash: Hash, value: &Bytes) -> Result<Bytes, InsertError> {
+        self.insert_blob_raw(hash, ValidationState::Validated, value)
     }
 
-    pub fn insert_unvalidated(&mut self, hash: Hash, value: &Bytes) -> Result<Bytes, InsertError> {
-        self.insert_raw(hash, ValidationState::Unvalidated, value)
+    pub fn insert_blob_unvalidated(&mut self, hash: Hash, value: &Bytes) -> Result<Bytes, InsertError> {
+        self.insert_blob_raw(hash, ValidationState::Unvalidated, value)
     }
 
-    pub fn get(&self, hash: &Hash) -> Result<Option<Bytes>, GetError> {
+    pub fn get_blob(&self, hash: &Hash) -> Result<Option<Bytes>, GetError> {
         let index = self.index.read().unwrap();
         let Some(blob) = index.get(hash) else {
             return Ok(None);
@@ -278,6 +316,29 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
         }
     }
 
+    pub fn commit_branch(&mut self, branch_id: Id, hash: Hash) -> Result<(), InsertError> {
+        let mut append = self.file.lock().unwrap();
+
+        let new_length = append.length + 64;
+        if new_length > MAX_PILE_SIZE {
+            return Err(InsertError::PileTooLarge);
+        }
+
+        append.length = new_length;
+
+        let header = BranchHeader::new(branch_id, hash);
+
+        append.file.write_all(header.as_bytes())?;
+
+        let mut branches = self.branches.write()?;
+        branches.insert(
+            branch_id,
+            hash
+        );
+
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), FlushError> {
         let append = self.file.lock()?;
         append.file.sync_data()?;
@@ -288,7 +349,7 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
 impl<const MAX_PILE_SIZE: usize> Extend<Bytes> for Pile<MAX_PILE_SIZE> {
     fn extend<T: IntoIterator<Item = Bytes>>(&mut self, iter: T) {
         for bytes in iter {
-            let _ = self.insert(&bytes);
+            let _ = self.insert_blob(&bytes);
         }
     }
 }
@@ -296,7 +357,7 @@ impl<const MAX_PILE_SIZE: usize> Extend<Bytes> for Pile<MAX_PILE_SIZE> {
 impl<const MAX_PILE_SIZE: usize> Extend<(Hash, Bytes)> for Pile<MAX_PILE_SIZE> {
     fn extend<T: IntoIterator<Item = (Hash, Bytes)>>(&mut self, iter: T) {
         for (hash, bytes) in iter {
-            let _ = self.insert_unvalidated(hash, &bytes);
+            let _ = self.insert_blob_unvalidated(hash, &bytes);
         }
     }
 }
@@ -324,7 +385,7 @@ mod tests {
             rng.fill_bytes(&mut record);
 
             let data = Bytes::from_source(record);
-            pile.insert(&data).unwrap();
+            pile.insert_blob(&data).unwrap();
         });
 
         pile.flush().unwrap();
