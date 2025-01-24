@@ -11,13 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, io::Write};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-const MAGIC_MARKER_BLOB: [u8; 16] = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
-const MAGIC_MARKER_BRANCH: [u8; 16] = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
-
-
-
 pub type Id = [u8; 16];
 pub type Hash = [u8; 32];
+
+const MAGIC_MARKER_BLOB: Id = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
+const MAGIC_MARKER_BRANCH: Id = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
+
 
 struct AppendFile {
     file: File,
@@ -146,6 +145,8 @@ impl<T> From<PoisonError<T>> for FlushError {
     }
 }
 
+//TODO Handle incomplete writes by truncating the file
+//TODO Add the ability to skip corrupted blobs
 impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
     pub fn load(path: &Path) -> Result<Self, LoadError> {
         let file = OpenOptions::new()
@@ -337,6 +338,11 @@ impl<const MAX_PILE_SIZE: usize> Pile<MAX_PILE_SIZE> {
         );
 
         Ok(())
+    }
+
+    pub fn get_branch(&self, branch_id: Id) -> Option<Hash>{
+        let branches = self.branches.read().unwrap();
+        branches.get(&branch_id).copied()
     }
 
     pub fn flush(&self) -> Result<(), FlushError> {
